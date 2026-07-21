@@ -1,0 +1,10 @@
+# Entorno virtual (317 MB, se recrea con pip install -r requirements.txt)
+venv/
+.venv/
+
+# Cache de Python
+__pycache__/
+*.pyc
+
+# Fotos generadas por los filtros
+output/
