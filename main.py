@@ -11,6 +11,7 @@ de las manos detectadas. Asi funciona igual con una mano (pinza) que con dos
 
 import os
 import sys
+import time
 from datetime import datetime
 
 import cv2
@@ -27,14 +28,15 @@ import registro
 
 MODELO = os.path.join(RAIZ, "modelos", "hand_landmarker.task")
 OUTPUT_DIR = os.path.join(RAIZ, "output")
-CAMARA = 2
+CAMARA = 0
+VENTANA = "PhotoMake - Ventana magica"
 
 # Indices de landmarks de MediaPipe
 PULGAR, INDICE = 4, 8
 
-SUAVIZADO = 0.4    # 0 = congelado, 1 = sin suavizar (tiembla)
-MARGEN = 0.06      # holgura alrededor de los dedos, en fraccion del recuadro
-MIN_LADO = 60      # px minimos por lado para considerar el encuadre utilizable
+SUAVIZADO = 0.4  # 0 = congelado, 1 = sin suavizar (tiembla)
+MARGEN = 0.06  # holgura alrededor de los dedos, en fraccion del recuadro
+MIN_LADO = 60  # px minimos por lado para considerar el encuadre utilizable
 
 # Los filtros guardan estado entre frames (la semilla del kmeans, y las capas
 # de papel/trama cacheadas por resolucion) y asumen que el tamaño no cambia.
@@ -49,8 +51,11 @@ def crear_detector():
         base_options=mp_python.BaseOptions(model_asset_path=MODELO),
         running_mode=vision.RunningMode.VIDEO,
         num_hands=2,
-        min_hand_detection_confidence=0.6,
-        min_tracking_confidence=0.5,
+        # Umbrales bajos: si mueves las manos rapido, con confianzas altas
+        # MediaPipe pierde el seguimiento y parpadea entre 1 y 2 manos.
+        min_hand_detection_confidence=0.4,
+        min_hand_presence_confidence=0.4,
+        min_tracking_confidence=0.3,
     )
     return vision.HandLandmarker.create_from_options(opciones)
 
@@ -75,8 +80,10 @@ def recuadro_de(puntos, w, h):
     mx = int((x2 - x1) * MARGEN)
     my = int((y2 - y1) * MARGEN)
     return (
-        max(0, x1 - mx), max(0, y1 - my),
-        min(w - 1, x2 + mx), min(h - 1, y2 + my),
+        max(0, x1 - mx),
+        max(0, y1 - my),
+        min(w - 1, x2 + mx),
+        min(h - 1, y2 + my),
     )
 
 
@@ -102,33 +109,92 @@ def aplicar_en_recuadro(img, caja, filtro):
 
 
 def dibujar_visor(img, caja, activo=True):
-    """Recuadro estilo visor de camara: esquinas marcadas y guias tenues."""
+    """Recuadro estilo visor: lineas negras finas con un aura de brillo.
+
+    El aura se hace dibujando primero la misma figura gruesa en un color vivo
+    sobre una copia y difuminandola; se mezcla con la imagen y encima van las
+    lineas negras finas, que quedan asi perfiladas por el resplandor.
+    """
     x1, y1, x2, y2 = caja
-    color = (80, 255, 80) if activo else (150, 150, 150)
+    aura = (0, 0, 0)
     largo = max(18, int(min(x2 - x1, y2 - y1) * 0.18))
 
-    cv2.rectangle(img, (x1, y1), (x2, y2), color, 1)
-    for cx, dx in ((x1, 1), (x2, -1)):
-        for cy, dy in ((y1, 1), (y2, -1)):
-            cv2.line(img, (cx, cy), (cx + dx * largo, cy), color, 3)
-            cv2.line(img, (cx, cy), (cx, cy + dy * largo), color, 3)
+    def figura(lienzo, color, grosor):
+        cv2.rectangle(lienzo, (x1, y1), (x2, y2), color, grosor, cv2.LINE_AA)
+        for cx, dx in ((x1, 1), (x2, -1)):
+            for cy, dy in ((y1, 1), (y2, -1)):
+                cv2.line(
+                    lienzo,
+                    (cx, cy),
+                    (cx + dx * largo, cy),
+                    color,
+                    grosor + 2,
+                    cv2.LINE_AA,
+                )
+                cv2.line(
+                    lienzo,
+                    (cx, cy),
+                    (cx, cy + dy * largo),
+                    color,
+                    grosor + 2,
+                    cv2.LINE_AA,
+                )
 
-    cv2.putText(img, f"{x2 - x1}x{y2 - y1}", (x1, max(20, y1 - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
+    # Aura negra: se pinta la figura en blanco sobre una capa, se difumina y se
+    # RESTA de la imagen. Sumar negro no haria nada; restar oscurece el halo.
+    capa = np.zeros_like(img)
+    figura(capa, (255, 255, 255), 4)
+    capa = cv2.GaussianBlur(capa, (0, 0), 6)
+    cv2.subtract(img, capa, img)
+
+    figura(img, aura, 1)
     return img
 
 
 def barra_estado(img, nombre_filtro, pista):
     h, w = img.shape[:2]
     cv2.rectangle(img, (0, h - 46), (w, h), (0, 0, 0), -1)
-    cv2.putText(img, f"[{nombre_filtro}]", (12, h - 26),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (80, 255, 80), 2, cv2.LINE_AA)
-    cv2.putText(img, pista, (12, h - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (210, 210, 210), 1, cv2.LINE_AA)
-    cv2.putText(img, "1-6 filtro  0 ninguno  ESPACIO guardar  ESC salir",
-                (w - 430, h - 26), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
-                (150, 150, 150), 1, cv2.LINE_AA)
+    cv2.putText(
+        img,
+        f"[{nombre_filtro}]",
+        (12, h - 26),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (80, 255, 80),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        img,
+        pista,
+        (12, h - 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (210, 210, 210),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        img,
+        "1-6 filtro  ESPACIO guardar  ENTER rafaga  F pantalla  ESC salir",
+        (w - 520, h - 26),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (150, 150, 150),
+        1,
+        cv2.LINE_AA,
+    )
     return img
+
+
+def guardar_recorte(limpio, caja):
+    """Guarda el recorte con filtro en OUTPUT_DIR y devuelve la ruta."""
+    x1, y1, x2, y2 = caja
+    sello = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    ruta = os.path.join(OUTPUT_DIR, f"Ventana_{sello}.png")
+    cv2.imwrite(ruta, limpio[y1:y2, x1:x2])
+    print(f"Guardado en: {ruta}  ({x2 - x1}x{y2 - y1})")
+    return ruta
 
 
 def main():
@@ -142,7 +208,7 @@ def main():
     for tecla, nombre, _, _, desc in registro.FILTROS:
         print(f"  [{tecla}] {nombre:<10} {desc}")
     print("  [0] ninguno")
-    print("\nESPACIO: guardar | ESC: salir\n")
+    print("\nESPACIO: guardar | F: pantalla completa | ESC: salir\n")
 
     print("Cargando filtros...")
     filtros = registro.cargar_todos()
@@ -153,8 +219,18 @@ def main():
         print(f"No se pudo abrir la camara {CAMARA}.")
         return
 
-    activo = "2"          # empieza en Comic
+    # WINDOW_NORMAL (no AUTOSIZE): asi la imagen se estira al tamaño real de la
+    # ventana. Con la ventana por defecto, al maximizar o poner pantalla
+    # completa el video se quedaba pequeño en una esquina. KEEPRATIO evita que
+    # se deforme si la proporcion de la pantalla no es la de la camara.
+    cv2.namedWindow(VENTANA, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    pantalla_completa = False
+
+    activo = "2"  # empieza en Comic
     caja_suave = None
+    INTERVALO = 2.0  # segundos entre fotos en modo rafaga
+    rafaga = False  # ENTER lo enciende/apaga
+    proximo_disparo = 0.0  # reloj real (time.monotonic) de la siguiente foto
     # detect_for_video exige timestamps estrictamente crecientes y revienta si
     # se repite uno. Un contador de frames lo garantiza; usar el reloj no, dos
     # frames pueden caer en el mismo milisegundo.
@@ -175,7 +251,8 @@ def main():
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             imagen_mp = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             nframe += 1
-            resultado = detector.detect_for_video(imagen_mp, nframe * 33)
+            ms = nframe * 33
+            resultado = detector.detect_for_video(imagen_mp, ms)
 
             puntos = puntos_de_encuadre(resultado, w, h)
             nombre_filtro = filtros[activo][0] if activo in filtros else "ninguno"
@@ -184,8 +261,10 @@ def main():
                 caja = np.array(recuadro_de(puntos, w, h), np.float32)
                 # Suavizado exponencial: los landmarks tiemblan entre frames y
                 # sin esto el recuadro vibra aunque tengas la mano quieta.
-                caja_suave = caja if caja_suave is None else (
-                    SUAVIZADO * caja + (1 - SUAVIZADO) * caja_suave
+                caja_suave = (
+                    caja
+                    if caja_suave is None
+                    else (SUAVIZADO * caja + (1 - SUAVIZADO) * caja_suave)
                 )
                 x1, y1, x2, y2 = caja_suave.astype(int)
 
@@ -217,31 +296,57 @@ def main():
                 limpio = frame
                 pista = "muestra las manos a la camara"
 
+            # Modo rafaga: dispara cada INTERVALO segundos mientras este activo
+            # y haya un encuadre valido. Si no lo hay, no gasta el turno: espera
+            # a que abras las manos y dispara en cuanto pueda.
+            if rafaga:
+                ahora = time.monotonic()
+                if ahora >= proximo_disparo:
+                    if listo and caja_suave is not None:
+                        guardar_recorte(limpio, caja_suave.astype(int))
+                        proximo_disparo = ahora + INTERVALO
+                restante = max(0.0, proximo_disparo - ahora)
+                pista = (
+                    f"RAFAGA cada {INTERVALO:.0f}s - ENTER para parar ({restante:.1f}s)"
+                )
+
             barra_estado(frame, nombre_filtro, pista)
-            cv2.imshow("PhotoMake - Ventana magica", frame)
+            cv2.imshow(VENTANA, frame)
 
             tecla = cv2.waitKey(1) & 0xFF
             caracter = chr(tecla) if 32 <= tecla < 127 else ""
 
             if tecla == 27:
                 break
-            if caracter == "0":
+            if caracter in ("f", "F"):
+                pantalla_completa = not pantalla_completa
+                cv2.setWindowProperty(
+                    VENTANA,
+                    cv2.WND_PROP_FULLSCREEN,
+                    cv2.WINDOW_FULLSCREEN if pantalla_completa else cv2.WINDOW_NORMAL,
+                )
+            elif caracter == "0":
                 activo = "0"
                 print("Filtro: ninguno")
             elif caracter in filtros:
                 activo = caracter
                 print(f"Filtro: {filtros[activo][0]}")
+            elif tecla in (13, 10):  # ENTER: enciende/apaga la rafaga
+                rafaga = not rafaga
+                if rafaga:
+                    proximo_disparo = time.monotonic()  # dispara ya la primera
+                    print(
+                        f"Rafaga ON: una foto cada {INTERVALO:.0f}s (ENTER para parar)."
+                    )
+                else:
+                    print("Rafaga OFF.")
             elif tecla == 32:
                 if caja_suave is None:
                     print("No veo tus manos.")
                 elif not listo:
                     print("Encuadre demasiado chico, abre mas las manos.")
                 else:
-                    x1, y1, x2, y2 = caja_suave.astype(int)
-                    sello = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    ruta = os.path.join(OUTPUT_DIR, f"Ventana_{sello}.png")
-                    cv2.imwrite(ruta, limpio[y1:y2, x1:x2])
-                    print(f"Guardado en: {ruta}  ({x2 - x1}x{y2 - y1})")
+                    guardar_recorte(limpio, caja_suave.astype(int))
     finally:
         cap.release()
         cv2.destroyAllWindows()
